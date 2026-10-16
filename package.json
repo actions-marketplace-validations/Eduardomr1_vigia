@@ -1,6 +1,6 @@
 {
   "name": "vigia",
-  "version": "1.2.0",
+  "version": "1.6.0",
   "description": "Flags tests that pass without verifying anything, and comments the finding on each Pull Request.",
   "license": "MIT",
   "files": [

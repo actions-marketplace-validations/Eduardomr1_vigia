@@ -1,5 +1,5 @@
 name: 'Vigía - Assertion Guard'
-description: 'Flags tests that pass without verifying anything, and comments the finding on the Pull Request.'
+description: 'Flags tests that pass without verifying anything, comments on Pull Requests, and publishes SARIF to GitHub Code Scanning.'
 author: 'Eduardo Maytorena'
 
 branding:
@@ -27,6 +27,22 @@ inputs:
     description: 'Post the result as a comment on the PR.'
     required: false
     default: 'true'
+  sarif:
+    description: 'Generate SARIF report for GitHub Code Scanning.'
+    required: false
+    default: 'true'
+  sarif-file:
+    description: 'Output path for the generated SARIF report.'
+    required: false
+    default: 'vigia-results.sarif'
+  upload-sarif:
+    description: 'Upload SARIF report to GitHub Code Scanning via @github/codeql-action/upload-sarif.'
+    required: false
+    default: 'true'
+  category:
+    description: 'Category name for GitHub Code Scanning.'
+    required: false
+    default: 'vigia'
 
 outputs:
   findings:
@@ -35,6 +51,9 @@ outputs:
   p1:
     description: 'Number of P1 findings.'
     value: ${{ steps.analyze.outputs.p1 }}
+  sarif-file:
+    description: 'Path to the generated SARIF report.'
+    value: ${{ inputs.sarif-file }}
 
 runs:
   using: 'composite'
@@ -75,10 +94,35 @@ runs:
 
         if [ -n "$LIST" ]; then
           node "${{ github.action_path }}/dist/cli.js" --format markdown $SRC --files $LIST > vigia-report.md || true
+          if [ "${{ inputs.sarif }}" = "true" ]; then
+            node "${{ github.action_path }}/dist/cli.js" --format sarif -o "${{ inputs.sarif-file }}" $SRC --files $LIST || true
+          fi
         else
           node "${{ github.action_path }}/dist/cli.js" "${{ inputs.path }}" $SRC --format markdown > vigia-report.md || true
+          if [ "${{ inputs.sarif }}" = "true" ]; then
+            node "${{ github.action_path }}/dist/cli.js" "${{ inputs.path }}" $SRC --format sarif -o "${{ inputs.sarif-file }}" || true
+          fi
         fi
+
         cat vigia-report.md
+
+        if [ "${{ inputs.sarif }}" = "true" ] && [ -f "${{ inputs.sarif-file }}" ]; then
+          node -e "
+            const fs = require('fs');
+            try {
+              const data = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+              const results = data.runs?.[0]?.results || [];
+              const p1 = results.filter(r => r.level === 'error').length;
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'findings=' + results.length + '\n');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'p1=' + p1 + '\n');
+            } catch (err) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'findings=0\np1=0\n');
+            }
+          " "${{ inputs.sarif-file }}"
+        else
+          echo "findings=0" >> "$GITHUB_OUTPUT"
+          echo "p1=0" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Comment on the PR
       if: inputs.comment == 'true' && github.event_name == 'pull_request'
@@ -86,6 +130,14 @@ runs:
       with:
         header: vigia
         path: vigia-report.md
+
+    - name: Upload SARIF report to GitHub Code Scanning
+      if: inputs.upload-sarif == 'true' && inputs.sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      continue-on-error: true
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: ${{ inputs.category }}
 
     - name: Fail if there are P1 findings
       if: inputs.fail-on-p1 == 'true'

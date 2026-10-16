@@ -1,0 +1,36 @@
+name: Vigía Dogfooding & Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: dogfooding-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dogfood:
+    name: Vigía Self-Dogfooding Action
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Vigía GitHub Action against itself
+        uses: ./
+        with:
+          path: 'src'
+          source: 'src'
+          changed-only: 'false'
+          sarif: 'true'
+          upload-sarif: 'true'
+          category: 'vigia-composite-action'
+          fail-on-p1: 'true'

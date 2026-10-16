@@ -229,6 +229,258 @@ function isLiteral(node: ts.Node): boolean {
   );
 }
 
+function capitalize(str: string): string {
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+function singularize(str: string): string {
+  if (str.endsWith('ies')) return str.slice(0, -3) + 'y';
+  if (str.endsWith('ses')) return str.slice(0, -2);
+  if (str.endsWith('s') && !str.endsWith('ss')) return str.slice(0, -1);
+  return str;
+}
+
+interface ParsedIdenticalAssertion {
+  readonly actual: ts.Expression;
+  readonly expected: ts.Expression;
+  readonly matcher: string;
+  readonly asyncModifier?: string | undefined;
+  readonly isChaiAssert?: boolean | undefined;
+}
+
+function parseIdenticalAssertion(node: ts.CallExpression): ParsedIdenticalAssertion | null {
+  // Pattern 1: expect(actual).toBe(expected) or expect(actual).resolves.toBe(expected)
+  if (ts.isPropertyAccessExpression(node.expression)) {
+    const matcher = node.expression.name.text;
+    if (matcher === 'toBe' || matcher === 'toEqual' || matcher === 'toStrictEqual') {
+      let receiver: ts.Expression = node.expression.expression;
+      let asyncModifier: string | undefined;
+
+      if (
+        ts.isPropertyAccessExpression(receiver) &&
+        (receiver.name.text === 'resolves' || receiver.name.text === 'rejects')
+      ) {
+        asyncModifier = receiver.name.text;
+        receiver = receiver.expression;
+      }
+
+      if (ts.isCallExpression(receiver) && calleeName(receiver.expression) === 'expect') {
+        const actual = receiver.arguments[0];
+        const expected = node.arguments[0];
+        if (actual && expected) {
+          return { actual, expected, matcher, asyncModifier, isChaiAssert: false };
+        }
+      }
+    }
+  }
+
+  // Pattern 2: Chai assert.equal(actual, expected) / assert.strictEqual / assert.deepEqual
+  if (
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'assert'
+  ) {
+    const matcher = node.expression.name.text;
+    if (matcher === 'equal' || matcher === 'strictEqual' || matcher === 'deepEqual') {
+      const actual = node.arguments[0];
+      const expected = node.arguments[1];
+      if (actual && expected) {
+        return { actual, expected, matcher, isChaiAssert: true };
+      }
+    }
+  }
+
+  return null;
+}
+
+function getIdenticalExpressionHint(
+  actualNode: ts.Expression,
+  matcher: string,
+  source: ts.SourceFile,
+  asyncModifier?: string,
+  isChaiAssert?: boolean,
+): string {
+  const actualText = actualNode.getText(source).replace(/\s+/g, ' ').trim();
+  const formatFix = (replacement: string) => {
+    if (isChaiAssert) {
+      return `assert.${matcher}(${actualText}, ${replacement})`;
+    }
+    const prefix = asyncModifier
+      ? `expect(${actualText}).${asyncModifier}`
+      : `expect(${actualText})`;
+    return `${prefix}.${matcher}(${replacement})`;
+  };
+
+  // 1. PropertyAccessExpression (e.g., user.id, data.status, response.data.items, actualUser.id)
+  if (ts.isPropertyAccessExpression(actualNode)) {
+    const propName = actualNode.name.text;
+    const objExpr = actualNode.expression;
+    const objText = objExpr.getText(source).replace(/\s+/g, ' ').trim();
+
+    // If the object name starts or ends with 'actual' (e.g. actualUser.id or actual.id)
+    if (objText.startsWith('actual') || objText.endsWith('Actual')) {
+      let suggestedObj = objText;
+      if (objText === 'actual') {
+        suggestedObj = 'expected';
+      } else if (objText.startsWith('actual')) {
+        suggestedObj = 'expected' + objText.slice(6);
+      } else if (objText.endsWith('Actual')) {
+        suggestedObj = objText.slice(0, -6) + 'Expected';
+      }
+      const fix = formatFix(`${suggestedObj}.${propName}`);
+      return `Likely copy-paste error. Replace '${actualText}' with '${suggestedObj}.${propName}' (e.g. ${fix}) instead of comparing '${actualText}' with itself.`;
+    }
+
+    // Standard property access: user.id -> suggest expectedId or expectedUser.id
+    const capitalizedProp = capitalize(propName);
+    const shortExpected = `expected${capitalizedProp}`;
+    const baseObj = objText.split('.').pop() || '';
+    const objExpected = baseObj ? `expected${capitalize(baseObj)}.${propName}` : '';
+
+    const fix1 = formatFix(shortExpected);
+    const fix2 = objExpected ? formatFix(objExpected) : '';
+    const examples = fix2 ? `${fix1} or ${fix2}` : fix1;
+
+    return `Likely copy-paste error. Replace '${actualText}' with the expected value (e.g. ${examples}) instead of comparing '${actualText}' with itself.`;
+  }
+
+  // 2. Identifier (e.g., data, user, actualData, actual, total)
+  if (ts.isIdentifier(actualNode)) {
+    const name = actualNode.text;
+    let suggestedVar = '';
+
+    if (name === 'actual') {
+      suggestedVar = 'expected';
+    } else if (name.startsWith('actual') && name.length > 6) {
+      suggestedVar = 'expected' + name.slice(6);
+    } else if (name.endsWith('Actual')) {
+      suggestedVar = name.slice(0, -6) + 'Expected';
+    } else {
+      suggestedVar = `expected${capitalize(name)}`;
+    }
+
+    const fix = formatFix(suggestedVar);
+    return `Likely copy-paste error. Replace '${actualText}' with the expected outcome (e.g. ${fix} or a fixture/literal) instead of comparing '${actualText}' with itself.`;
+  }
+
+  // 3. CallExpression (e.g., calculateTotal(), getUser(1), service.getData())
+  if (ts.isCallExpression(actualNode)) {
+    const callee = actualNode.expression;
+    let baseName = 'Result';
+
+    if (ts.isIdentifier(callee)) {
+      baseName = callee.text;
+    } else if (ts.isPropertyAccessExpression(callee)) {
+      baseName = callee.name.text;
+    }
+
+    for (const prefix of ['get', 'calculate', 'compute', 'fetch', 'find', 'create', 'build', 'load']) {
+      if (baseName.startsWith(prefix) && baseName.length > prefix.length) {
+        baseName = baseName.slice(prefix.length);
+        break;
+      }
+    }
+
+    const suggestedVar = `expected${capitalize(baseName)}`;
+    const fix = formatFix(suggestedVar);
+    return `Likely copy-paste error. Replace '${actualText}' with the expected result (e.g. ${fix}) instead of invoking '${actualText}' on both sides.`;
+  }
+
+  // 4. ElementAccessExpression (e.g., items[0], list[i])
+  if (ts.isElementAccessExpression(actualNode)) {
+    const objText = actualNode.expression.getText(source).replace(/\s+/g, ' ').trim();
+    const argText = actualNode.argumentExpression
+      ? actualNode.argumentExpression.getText(source).replace(/\s+/g, ' ').trim()
+      : '0';
+
+    if (objText.startsWith('actual')) {
+      const suggestedObj = objText === 'actual' ? 'expected' : 'expected' + objText.slice(6);
+      const fix = formatFix(`${suggestedObj}[${argText}]`);
+      return `Likely copy-paste error. Replace '${actualText}' with '${suggestedObj}[${argText}]' (e.g. ${fix}) instead of comparing '${actualText}' with itself.`;
+    }
+
+    const baseName = objText.split('.').pop() || 'items';
+    const singularName = singularize(baseName);
+    const fix1 = formatFix(`expected${capitalize(singularName)}`);
+    const fix2 = formatFix(`expected${capitalize(baseName)}[${argText}]`);
+
+    return `Likely copy-paste error. Replace '${actualText}' with the expected element (e.g. ${fix1} or ${fix2}) instead of comparing '${actualText}' with itself.`;
+  }
+
+  // 5. BinaryExpression (e.g., a + b)
+  if (ts.isBinaryExpression(actualNode)) {
+    const fix = formatFix('expectedResult');
+    return `Likely copy-paste error. Replace '${actualText}' with the expected calculation result (e.g. ${fix}) instead of evaluating '${actualText}' on both sides.`;
+  }
+
+  // 6. Generic fallback
+  const fix = formatFix('expectedValue');
+  return `Likely copy-paste error. Replace '${actualText}' with the expected outcome (e.g. ${fix}) instead of comparing '${actualText}' with itself.`;
+}
+
+/**
+ * Asserting that an expression equals itself checks nothing and conceals copy-paste typos.
+ * E.g., `expect(user.id).toBe(user.id)` or `expect(data.status).toEqual(data.status)`.
+ */
+export const identicalExpression: Rule = (context) => {
+  const findings: Finding[] = [];
+
+  walk(context.source, (node) => {
+    if (!ts.isCallExpression(node)) return;
+
+    const parsed = parseIdenticalAssertion(node);
+    if (!parsed) return;
+
+    const { actual, expected, matcher, asyncModifier, isChaiAssert } = parsed;
+
+    let actualCleanNode = actual;
+    while (ts.isParenthesizedExpression(actualCleanNode)) {
+      actualCleanNode = actualCleanNode.expression;
+    }
+
+    let expectedCleanNode = expected;
+    while (ts.isParenthesizedExpression(expectedCleanNode)) {
+      expectedCleanNode = expectedCleanNode.expression;
+    }
+
+    // Literals are handled by the 'tautology' rule
+    if (isLiteral(actualCleanNode) && isLiteral(expectedCleanNode)) return;
+
+    const actualCleanText = actualCleanNode.getText(context.source).replace(/\s+/g, ' ').trim();
+    const expectedCleanText = expectedCleanNode.getText(context.source).replace(/\s+/g, ' ').trim();
+    if (actualCleanText !== expectedCleanText) return;
+
+    const fullAssertion = isChaiAssert
+      ? `assert.${matcher}(${actualCleanText}, ${expectedCleanText})`
+      : asyncModifier
+      ? `expect(${actualCleanText}).${asyncModifier}.${matcher}(${expectedCleanText})`
+      : `expect(${actualCleanText}).${matcher}(${expectedCleanText})`;
+
+    const message = `${fullAssertion} compares an expression against itself: likely a copy-paste error.`;
+    const hint = getIdenticalExpressionHint(
+      actualCleanNode,
+      matcher,
+      context.source,
+      asyncModifier,
+      isChaiAssert,
+    );
+
+    findings.push(
+      finding(
+        context,
+        node,
+        'identical-expression',
+        'P1',
+        message,
+        hint,
+      ),
+    );
+  });
+
+  return findings;
+};
+
 /** A skipped test protects nothing, and gets forgotten. */
 export const skippedTest: Rule = (context) => {
   const findings: Finding[] = [];
@@ -493,12 +745,319 @@ function hasFailureGuard(tryBlock: ts.Block): boolean {
   return found;
 }
 
+const PLAYWRIGHT_BOOLEAN_METHODS: Record<string, string> = {
+  isVisible: 'toBeVisible',
+  isHidden: 'toBeHidden',
+  isEnabled: 'toBeEnabled',
+  isDisabled: 'toBeDisabled',
+  isChecked: 'toBeChecked',
+  isEditable: 'toBeEditable',
+};
+
+interface ParsedBooleanAssertion {
+  readonly expectCall: ts.CallExpression;
+  readonly actual: ts.Expression;
+  readonly matcher: string;
+  readonly hasNot: boolean;
+  readonly isPositive: boolean;
+}
+
+function parseBooleanAssertion(node: ts.CallExpression): ParsedBooleanAssertion | null {
+  if (!ts.isPropertyAccessExpression(node.expression)) return null;
+
+  const matcher = node.expression.name.text;
+  let hasNot = false;
+  let target: ts.Expression = node.expression.expression;
+
+  if (ts.isPropertyAccessExpression(target) && target.name.text === 'not') {
+    hasNot = true;
+    target = target.expression;
+  }
+
+  if (!ts.isCallExpression(target)) return null;
+  if (calleeName(target.expression) !== 'expect') return null;
+
+  const expectCall = target;
+  let actual = expectCall.arguments[0];
+  if (!actual) return null;
+
+  while (ts.isParenthesizedExpression(actual)) {
+    actual = actual.expression;
+  }
+
+  let isPositive: boolean;
+  if (matcher === 'toBe' || matcher === 'toEqual' || matcher === 'toStrictEqual') {
+    if (node.arguments.length === 0) return null;
+    const arg = node.arguments[0];
+    if (!arg) return null;
+    if (arg.kind === ts.SyntaxKind.TrueKeyword) {
+      isPositive = true;
+    } else if (arg.kind === ts.SyntaxKind.FalseKeyword) {
+      isPositive = false;
+    } else {
+      return null;
+    }
+  } else if (matcher === 'toBeTruthy') {
+    isPositive = true;
+  } else if (matcher === 'toBeFalsy') {
+    isPositive = false;
+  } else {
+    return null;
+  }
+
+  return { expectCall, actual, matcher, hasNot, isPositive };
+}
+
+interface AssertionSuggestion {
+  readonly suggestedFix?: string;
+  readonly customHint?: string;
+}
+
+function getBooleanAssertionSuggestion(
+  expr: ts.Expression,
+  targetBool: boolean,
+  source: ts.SourceFile,
+): AssertionSuggestion | null {
+  let actual = expr;
+  while (ts.isParenthesizedExpression(actual)) {
+    actual = actual.expression;
+  }
+
+  if (ts.isBinaryExpression(actual)) {
+    const op = actual.operatorToken.kind;
+    let left = actual.left;
+    let right = actual.right;
+
+    while (ts.isParenthesizedExpression(left)) left = left.expression;
+    while (ts.isParenthesizedExpression(right)) right = right.expression;
+
+    const leftText = left.getText(source).trim();
+    const rightText = right.getText(source).trim();
+
+    if (op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsToken) {
+      if (right.kind === ts.SyntaxKind.TrueKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).toBe(true)` }
+          : { suggestedFix: `expect(${leftText}).not.toBe(true)` };
+      }
+      if (right.kind === ts.SyntaxKind.FalseKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).toBe(false)` }
+          : { suggestedFix: `expect(${leftText}).not.toBe(false)` };
+      }
+      if (left.kind === ts.SyntaxKind.TrueKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${rightText}).toBe(true)` }
+          : { suggestedFix: `expect(${rightText}).not.toBe(true)` };
+      }
+      if (left.kind === ts.SyntaxKind.FalseKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${rightText}).toBe(false)` }
+          : { suggestedFix: `expect(${rightText}).not.toBe(false)` };
+      }
+
+      if (op === ts.SyntaxKind.EqualsEqualsEqualsToken) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).toBe(${rightText})` }
+          : { suggestedFix: `expect(${leftText}).not.toBe(${rightText})` };
+      } else {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).toEqual(${rightText})` }
+          : { suggestedFix: `expect(${leftText}).not.toEqual(${rightText})` };
+      }
+    }
+
+    if (op === ts.SyntaxKind.ExclamationEqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsToken) {
+      if (right.kind === ts.SyntaxKind.TrueKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).not.toBe(true)` }
+          : { suggestedFix: `expect(${leftText}).toBe(true)` };
+      }
+      if (right.kind === ts.SyntaxKind.FalseKeyword) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).not.toBe(false)` }
+          : { suggestedFix: `expect(${leftText}).toBe(false)` };
+      }
+
+      if (op === ts.SyntaxKind.ExclamationEqualsEqualsToken) {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).not.toBe(${rightText})` }
+          : { suggestedFix: `expect(${leftText}).toBe(${rightText})` };
+      } else {
+        return targetBool
+          ? { suggestedFix: `expect(${leftText}).not.toEqual(${rightText})` }
+          : { suggestedFix: `expect(${leftText}).toEqual(${rightText})` };
+      }
+    }
+
+    if (op === ts.SyntaxKind.GreaterThanToken) {
+      return targetBool
+        ? { suggestedFix: `expect(${leftText}).toBeGreaterThan(${rightText})` }
+        : { suggestedFix: `expect(${leftText}).toBeLessThanOrEqual(${rightText})` };
+    }
+
+    if (op === ts.SyntaxKind.GreaterThanEqualsToken) {
+      return targetBool
+        ? { suggestedFix: `expect(${leftText}).toBeGreaterThanOrEqual(${rightText})` }
+        : { suggestedFix: `expect(${leftText}).toBeLessThan(${rightText})` };
+    }
+
+    if (op === ts.SyntaxKind.LessThanToken) {
+      return targetBool
+        ? { suggestedFix: `expect(${leftText}).toBeLessThan(${rightText})` }
+        : { suggestedFix: `expect(${leftText}).toBeGreaterThanOrEqual(${rightText})` };
+    }
+
+    if (op === ts.SyntaxKind.LessThanEqualsToken) {
+      return targetBool
+        ? { suggestedFix: `expect(${leftText}).toBeLessThanOrEqual(${rightText})` }
+        : { suggestedFix: `expect(${leftText}).toBeGreaterThan(${rightText})` };
+    }
+
+    if (op === ts.SyntaxKind.InstanceOfKeyword) {
+      return targetBool
+        ? { suggestedFix: `expect(${leftText}).toBeInstanceOf(${rightText})` }
+        : { suggestedFix: `expect(${leftText}).not.toBeInstanceOf(${rightText})` };
+    }
+
+    if (op === ts.SyntaxKind.InKeyword) {
+      return targetBool
+        ? { suggestedFix: `expect(${rightText}).toHaveProperty(${leftText})` }
+        : { suggestedFix: `expect(${rightText}).not.toHaveProperty(${leftText})` };
+    }
+
+    if (op === ts.SyntaxKind.AmpersandAmpersandToken) {
+      return {
+        customHint: `Split into separate assertions: expect(${leftText}).toBeTruthy() and expect(${rightText}).toBeTruthy() for clearer diagnostics.`,
+      };
+    }
+
+    if (op === ts.SyntaxKind.BarBarToken) {
+      return {
+        customHint: `Avoid logical OR in assertions; assert on specific expected outcomes instead.`,
+      };
+    }
+
+    return null;
+  }
+
+  if (ts.isCallExpression(actual)) {
+    if (
+      ts.isPropertyAccessExpression(actual.expression) &&
+      actual.expression.name.text === 'includes' &&
+      actual.arguments.length >= 1
+    ) {
+      const objText = actual.expression.expression.getText(source).trim();
+      const argText = actual.arguments[0]!.getText(source).trim();
+      return targetBool
+        ? { suggestedFix: `expect(${objText}).toContain(${argText})` }
+        : { suggestedFix: `expect(${objText}).not.toContain(${argText})` };
+    }
+
+    if (
+      ts.isIdentifier(actual.expression) &&
+      actual.expression.text === 'Boolean' &&
+      actual.arguments.length === 1
+    ) {
+      const argText = actual.arguments[0]!.getText(source).trim();
+      return targetBool
+        ? { suggestedFix: `expect(${argText}).toBeTruthy()` }
+        : { suggestedFix: `expect(${argText}).toBeFalsy()` };
+    }
+
+    if (ts.isPropertyAccessExpression(actual.expression)) {
+      const methodName = actual.expression.name.text;
+      const pwMatcher = PLAYWRIGHT_BOOLEAN_METHODS[methodName];
+      if (pwMatcher) {
+        const locText = actual.expression.expression.getText(source).trim();
+        return targetBool
+          ? { suggestedFix: `await expect(${locText}).${pwMatcher}()` }
+          : { suggestedFix: `await expect(${locText}).not.${pwMatcher}()` };
+      }
+    }
+  }
+
+  if (ts.isAwaitExpression(actual) && ts.isCallExpression(actual.expression)) {
+    const call = actual.expression;
+    if (ts.isPropertyAccessExpression(call.expression)) {
+      const methodName = call.expression.name.text;
+      const pwMatcher = PLAYWRIGHT_BOOLEAN_METHODS[methodName];
+      if (pwMatcher) {
+        const locText = call.expression.expression.getText(source).trim();
+        return targetBool
+          ? { suggestedFix: `await expect(${locText}).${pwMatcher}()` }
+          : { suggestedFix: `await expect(${locText}).not.${pwMatcher}()` };
+      }
+    }
+  }
+
+  if (
+    ts.isPrefixUnaryExpression(actual) &&
+    actual.operator === ts.SyntaxKind.ExclamationToken
+  ) {
+    let inner: ts.Expression = actual.operand;
+    while (ts.isParenthesizedExpression(inner)) inner = inner.expression;
+
+    const innerSuggestion = getBooleanAssertionSuggestion(inner, !targetBool, source);
+    if (innerSuggestion) return innerSuggestion;
+
+    const innerText = inner.getText(source).trim();
+    return targetBool
+      ? { suggestedFix: `expect(${innerText}).toBe(false)` }
+      : { suggestedFix: `expect(${innerText}).toBe(true)` };
+  }
+
+  return null;
+}
+
+/**
+ * Asserting boolean conditions with `.toBe(true)`, `.toBeTruthy()`, etc.,
+ * conceals the actual values and prevents useful failure diffs.
+ * E.g., `expect(a === b).toBe(true)` instead of `expect(a).toBe(b)`.
+ */
+export const redundantBooleanAssertion: Rule = (context) => {
+  const findings: Finding[] = [];
+
+  walk(context.source, (node) => {
+    if (!ts.isCallExpression(node)) return;
+
+    const parsed = parseBooleanAssertion(node);
+    if (!parsed) return;
+
+    const { actual, hasNot, isPositive } = parsed;
+    const targetBool = hasNot ? !isPositive : isPositive;
+
+    const suggestion = getBooleanAssertionSuggestion(actual, targetBool, context.source);
+    if (!suggestion) return;
+
+    const nodeText = node.getText(context.source).replace(/\s+/g, ' ').trim();
+    const hint =
+      suggestion.customHint ??
+      `Use ${suggestion.suggestedFix} instead for clearer failure diffs and semantic assertions.`;
+
+    findings.push(
+      finding(
+        context,
+        node,
+        'redundant-boolean-assertion',
+        'P2',
+        `Redundant boolean assertion: ${nodeText}.`,
+        hint,
+      ),
+    );
+  });
+
+  return findings;
+};
+
 export const rules: readonly Rule[] = [
   noAssertion,
   expectWithoutMatcher,
   tautology,
+  identicalExpression,
   skippedTest,
   focusedTest,
   missingAwait,
   assertionInCatch,
+  redundantBooleanAssertion,
 ];
